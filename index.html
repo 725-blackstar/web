@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>手势粒子魔法 · Hand Magic Particles</title>
+<link rel="icon" href="data:,">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#05050c; font-family:'Segoe UI','Microsoft YaHei',sans-serif; }
+  #video {
+    position:fixed; top:0; left:0; width:100%; height:100%;
+    object-fit:cover; transform:scaleX(-1); z-index:0;
+    filter:brightness(0.82) saturate(1.1) contrast(1.02);
+  }
+  #scene { position:fixed; top:0; left:0; width:100%; height:100%; z-index:1; }
+  #scene canvas { display:block; }
+  .pill {
+    position:fixed; left:50%; transform:translateX(-50%); z-index:3;
+    background:rgba(8,6,16,0.55); color:#fff;
+    border:1px solid rgba(255,255,255,0.16);
+    border-radius:22px; padding:8px 20px; font-size:13px; letter-spacing:0.4px;
+    backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+    box-shadow:0 6px 30px rgba(0,0,0,0.35);
+    text-align:center; pointer-events:none; line-height:1.55;
+  }
+  #status { top:14px; white-space:nowrap; }
+  #hint { bottom:14px; font-size:12.5px; }
+  #badge { top:14px; left:14px; transform:none; font-size:12px; padding:6px 14px; opacity:0.9; }
+  #badge b { color:#ff9ecf; }
+  .tag { color:#ffb3d9; }
+  #loading { position:fixed; inset:0; z-index:5; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; color:#fff; background:rgba(5,5,12,0.72); backdrop-filter:blur(4px); font-size:15px; letter-spacing:1px; transition:opacity 0.6s; }
+  #loading.hide { opacity:0; pointer-events:none; }
+  .spinner { width:40px; height:40px; border-radius:50%; border:3px solid rgba(255,158,207,0.25); border-top-color:#ff9ecf; animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #err { color:#ff7b9c; font-size:13px; letter-spacing:0; text-align:center; max-width:80vw; }
+</style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <div id="scene"></div>
+  <div class="pill" id="badge">✨ <b>Hand Magic</b></div>
+  <div class="pill" id="status">正在初始化…</div>
+  <div class="pill" id="hint">
+    左手：<span class="tag">1指=hello</span> · <span class="tag">2指=你好，同学</span> · <span class="tag">3指=欢迎加入网络安全社！</span>
+    <br>
+    右手：<span class="tag">张开=粒子扩散+旋转</span> · <span class="tag">握拳=爱心</span>
+  </div>
+  <div id="loading"><div class="spinner"></div><div>正在启动摄像头并加载手势模型…</div><div id="err"></div></div>
+
+  <script src="./lib/mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="./lib/mediapipe/hands/hands.js"></script>
+
+  <script type="module">
+  /* ============================ three.js 多CDN加载 ============================ */
+  async function loadThree(){
+    const urls = [
+      './lib/three/three.module.js',
+      'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js',
+      'https://unpkg.com/three@0.160.0/build/three.module.js',
+      'https://registry.npmmirror.com/three/0.160.0/files/build/three.module.js',
+    ];
+    for (const u of urls) {
+      try { return await import(u); } catch (e) {}
+    }
+    return null;
+  }
+  const THREE = await loadThree();
+  if (!THREE) {
+    document.getElementById('err').textContent = 'three.js CDN 加载失败，请检查网络后刷新页面。';
+    throw new Error('three.js load failed');
+  }
+
+  const video = document.getElementById('video');
+  const statusEl = document.getElementById('status');
+  const loadingEl = document.getElementById('loading');
+
+  /* ============================ Three.js ============================ */
+  const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x000000, 0);
+  document.getElementById('scene').appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 100);
+  camera.position.set(0, 0, 9.5);
+  camera.lookAt(0, 0, 0);
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  function makeSpriteTexture(){
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const g = c.getContext('2d');
+    const gr = g.createRadialGradient(32,32,0,32,32,32);
+    gr.addColorStop(0, 'rgba(255,255,255,1)');
+    gr.addColorStop(0.25, 'rgba(255,255,255,0.9)');
+    gr.addColorStop(0.6, 'rgba(255,255,255,0.35)');
+    gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0,0,64,64);
+    return new THREE.CanvasTexture(c);
+  }
+
+  /* ============================ 粒子系统 ============================ */
+  const N = 26000;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(N*3);
+  const col = new Float32Array(N*3);
+
+  const px = new Float32Array(N), py = new Float32Array(N), pz = new Float32Array(N);
+  const vx = new Float32Array(N), vy = new Float32Array(N), vz = new Float32Array(N);
+  const hx = new Float32Array(N), hy = new Float32Array(N), hz = new Float32Array(N);
+  const wn = new Float32Array(N);        // 随机游走强度
+  const base = new Float32Array(N*3);    // 基础颜色 rgb
+  const pha = new Float32Array(N);       // 闪烁相位
+  const textIdx = new Int32Array(N);
+  const heartPts = new Float32Array(N*3);
+
+  const white = new THREE.Color(1,1,1);
+  for (let i = 0; i < N; i++) {
+    const r = Math.cbrt(Math.random()) * 3.6;
+    const th = Math.random() * Math.PI * 2;
+    const ph = Math.acos(2*Math.random()-1);
+    hx[i] = r * Math.sin(ph) * Math.cos(th);
+    hy[i] = r * Math.sin(ph) * Math.sin(th) * 0.62;
+    hz[i] = r * Math.cos(ph) * 0.5;
+    px[i] = (Math.random()-0.5) * 0.4;
+    py[i] = (Math.random()-0.5) * 0.4;
+    pz[i] = (Math.random()-0.5) * 0.4;
+    wn[i] = 0.5 + Math.random();
+    pha[i] = Math.random() * Math.PI * 2;
+    const c = (Math.random() < 0.32) ? white : new THREE.Color().setHSL(0.935 + Math.random()*0.045, 0.5 + Math.random()*0.32, 0.7 + Math.random()*0.22);
+    base[i*3] = c.r; base[i*3+1] = c.g; base[i*3+2] = c.b;
+    textIdx[i] = 0;
+  }
+
+  /* 爱心目标点（固定采样，供收缩时使用） */
+  const HWS = 2.4;
+  for (let i = 0; i < N; i++) {
+    const t = Math.random() * Math.PI * 2;
+    const cx = 16 * Math.pow(Math.sin(t), 3);
+    const cy = 13*Math.cos(t) - 5*Math.cos(2*t) - 2*Math.cos(3*t) - Math.cos(4*t);
+    const rr = Math.sqrt(Math.random());
+    const x = cx * rr, y = cy * rr;
+    const z = (Math.random()-0.5) * (1 - rr) * 0.6;
+    heartPts[i*3]   = x / 16;
+    heartPts[i*3+1] = (y + 1.75) / 22;
+    heartPts[i*3+2] = z;
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+
+  const mat = new THREE.PointsMaterial({
+    size: 0.032,
+    map: makeSpriteTexture(),
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.88,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    sizeAttenuation: true,
+  });
+  scene.add(new THREE.Points(geo, mat));
+
+  /* ============================ 文字采样 ============================ */
+  const fitW = 7.2, fitH = 2.6;
+  const textCache = {};
+  function sampleText(text){
+    const isLatin = /[A-Za-z]/.test(text);
+    const size = isLatin ? 230 : 170;
+    const pad = 40;
+    const c = document.createElement('canvas');
+    const g = c.getContext('2d');
+    const font = size + 'px ' + (isLatin
+      ? '"Arial Black","Arial","Segoe UI",sans-serif'
+      : '"Microsoft YaHei","PingFang SC","Noto Sans SC","SimHei",sans-serif');
+    g.font = font;
+    const w = Math.ceil(g.measureText(text).width) + pad*2;
+    const h = Math.ceil(size*1.5) + pad*2;
+    c.width = w; c.height = h;
+    g.font = font; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillStyle = '#fff';
+    g.fillText(text, w/2, h/2);
+    const img = g.getImageData(0,0,w,h).data;
+    const pts = [];
+    for (let y = 0; y < h; y += 2) {
+      for (let x = 0; x < w; x += 2) {
+        if (img[(y*w+x)*4+3] > 100) pts.push([x, y]);
+      }
+    }
+    if (pts.length < 200) return null;
+    let minX=1e9, maxX=-1e9, minY=1e9, maxY=-1e9;
+    for (const p of pts) { minX=Math.min(minX,p[0]); maxX=Math.max(maxX,p[0]); minY=Math.min(minY,p[1]); maxY=Math.max(maxY,p[1]); }
+    const cx = (minX+maxX)/2, cy = (minY+maxY)/2;
+    const s = Math.min(fitW/(maxX-minX), fitH/(maxY-minY));
+    const out = [];
+    for (const p of pts) out.push([(p[0]-cx)*s, -(p[1]-cy)*s, (Math.random()-0.5)*0.35]);
+    return out;
+  }
+  function getTextPoints(text){
+    if (!textCache[text]) textCache[text] = sampleText(text);
+    return textCache[text];
+  }
+
+  let currentText = '';
+  let textPts = null;
+  let txtScale = 1;
+  function ensureText(text){
+    if (text === currentText && textPts) return;
+    const pts = getTextPoints(text);
+    if (!pts) return;
+    currentText = text;
+    textPts = pts;
+    let minX=1e9, maxX=-1e9, minY=1e9, maxY=-1e9;
+    for (const p of pts) { minX=Math.min(minX,p[0]); maxX=Math.max(maxX,p[0]); minY=Math.min(minY,p[1]); maxY=Math.max(maxY,p[1]); }
+    txtScale = Math.min(Math.min(fitW/(maxX-minX), fitH/(maxY-minY)), 1.15);
+    for (let i = 0; i < N; i++) textIdx[i] = (Math.random() * pts.length) | 0;
+  }
+
+  /* ============================ 心跳 ============================ */
+  function heartbeat(t){
+    const T = 0.82;
+    const ph = t % T;
+    const p1 = Math.exp(-Math.pow(ph-0.12, 2) / (2*0.04*0.04));
+    const p2 = Math.exp(-Math.pow(ph-0.34, 2) / (2*0.06*0.06));
+    return p1*0.95 + p2*0.6;
+  }
+
+  /* ============================ 手势状态 ============================ */
+  const state = {
+    left:  { present:false, x:0, y:0, z:0, scale:0, gesture:0, raw:-1, stable:0 },
+    right: { present:false, x:0, y:0, z:0, scale:0, open:true, angle:0, prev:0, smoothAngVel:0 },
+  };
+
+  function videoToWorld(nx, ny, nz){
+    const cw = window.innerWidth, ch = window.innerHeight;
+    const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+    const sx = 1 - nx;
+    const va = vw/vh, ca = cw/ch;
+    let px2, py2;
+    if (va > ca) {
+      const dispW = ch * va;
+      px2 = sx*dispW - (dispW-cw)/2;
+      py2 = ny*ch;
+    } else {
+      const dispH = cw / va;
+      px2 = sx*cw;
+      py2 = ny*dispH - (dispH-ch)/2;
+    }
+    const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov/2)) * camera.position.z;
+    const halfW = halfH * (cw/ch);
+    return { x:(px2/cw*2-1)*halfW, y:-(py2/ch*2-1)*halfH, z:nz*3.0 };
+  }
+  function palmCenter(lm){
+    let x=0,y=0,z=0;
+    for (const k of [0,5,9,13,17]) { x+=lm[k].x; y+=lm[k].y; z+=lm[k].z; }
+    return videoToWorld(x/5, y/5, z/5);
+  }
+  function fingersExtended(lm){
+    const wrist = lm[0];
+    const tips = [8,12,16,20], pips = [6,10,14,18];
+    let count = 0;
+    for (let f = 0; f < 4; f++) {
+      const dTip = Math.hypot(lm[tips[f]].x-wrist.x, lm[tips[f]].y-wrist.y);
+      const dPip = Math.hypot(lm[pips[f]].x-wrist.x, lm[pips[f]].y-wrist.y);
+      if (dTip > dPip * 1.08) count++;
+    }
+    const t1 = Math.hypot(lm[4].x-lm[2].x, lm[4].y-lm[2].y);
+    const t2 = Math.hypot(lm[3].x-lm[2].x, lm[3].y-lm[2].y);
+    return { count, thumb: t1 > t2*1.25 };
+  }
+  function handSize(lm){
+    const a = videoToWorld(lm[0].x, lm[0].y, lm[0].z);
+    const b = videoToWorld(lm[5].x, lm[5].y, lm[5].z);
+    return Math.hypot(a.x-b.x, a.y-b.y);
+  }
+
+  function updateHand(name, lm, dt){
+    const st = state[name];
+    if (!lm) { st.present = false; if (name === 'left') st.gesture = 0; return; }
+    st.present = true;
+    const c = palmCenter(lm);
+    st.x += (c.x-st.x)*0.5; st.y += (c.y-st.y)*0.5; st.z += (c.z-st.z)*0.5;
+    const hs = handSize(lm);
+    st.scale = st.scale ? st.scale*0.7 + hs*0.3 : hs;
+
+    if (name === 'right') {
+      const a = videoToWorld(lm[0].x, lm[0].y, lm[0].z);
+      const b = videoToWorld(lm[9].x, lm[9].y, lm[9].z);
+      const ang = Math.atan2(b.y-a.y, b.x-a.x);
+      let dA = ang - st.prev;
+      if (dA >  Math.PI) dA -= Math.PI*2;
+      if (dA < -Math.PI) dA += Math.PI*2;
+      st.prev = ang;
+      const av = dt > 0 ? dA/dt : 0;
+      st.smoothAngVel = st.smoothAngVel*0.86 + av*0.14;
+      st.smoothAngVel = Math.max(-5, Math.min(5, st.smoothAngVel));
+      const cnt = fingersExtended(lm).count;
+      if (cnt >= 3) st.open = true;
+      else if (cnt <= 1) st.open = false;
+    } else {
+      const cnt = fingersExtended(lm).count;
+      if (cnt !== st.raw) { st.raw = cnt; st.stable = 0; }
+      else st.stable++;
+      if (st.stable >= 8) {
+        if (cnt >= 1 && cnt <= 3) st.gesture = cnt;
+        else if (cnt === 0) st.gesture = 0;
+      }
+    }
+  }
+
+  let lastFrame = performance.now();
+  let gotFirst = false;
+  function onResults(results){
+    if (!gotFirst) { gotFirst = true; loadingEl.classList.add('hide'); }
+    const handsArr = results.multiHandLandmarks || [];
+    const sorted = handsArr.map(lm => ({ lm, sx: 1-lm[0].x })).sort((A,B) => A.sx - B.sx);
+    const now = performance.now();
+    const dt = Math.max(0.001, (now - lastFrame)/1000);
+    lastFrame = now;
+    updateHand('left',  sorted[0] ? sorted[0].lm : null, dt);
+    updateHand('right', sorted[1] ? sorted[1].lm : null, dt);
+  }
+
+  /* ============================ 粒子主循环 ============================ */
+  const TEXT_LIST = ['', 'hello', '你好，同学', '欢迎加入网络安全社！'];
+  let mode = 'diffuse';
+
+  function updateParticles(dt, t){
+    let want;
+    if (state.right.present && !state.right.open) {
+      want = 'heart';
+    } else if (state.left.present && state.left.gesture > 0) {
+      want = 'text';
+      ensureText(TEXT_LIST[state.left.gesture]);
+    } else {
+      want = 'diffuse';
+    }
+    mode = want;
+
+    const kT = 1 - Math.exp(-7*dt);
+    const kH = 1 - Math.exp(-5*dt);
+    const kD = 1 - Math.exp(-2.2*dt);
+    const damp = Math.exp(-(mode === 'diffuse' ? 4.2 : 2.6)*dt);
+    const wander = mode === 'text' ? 0.018 : (mode === 'heart' ? 0.02 : 0.022);
+
+    const haveR = state.right.present;
+    const sw = haveR ? state.right.smoothAngVel * 1.1 : 0;
+    const rx = state.right.x, ry = state.right.y;
+
+    const haveL = state.left.present;
+    const lx = state.left.x, ly = state.left.y, lz = state.left.z;
+    const LR = haveL ? state.left.scale * 4.2 : 0;
+
+    const beatS = 1 + 0.13 * heartbeat(t);
+
+    for (let i = 0; i < N; i++) {
+      const i3 = i*3;
+      let tx, ty, tz;
+      if (mode === 'text') {
+        const p = textPts[textIdx[i]];
+        tx = p[0]*txtScale; ty = p[1]*txtScale; tz = p[2]*txtScale;
+      } else if (mode === 'heart') {
+        tx = heartPts[i3]*HWS*beatS;
+        ty = heartPts[i3+1]*HWS*beatS;
+        tz = heartPts[i3+2]*HWS*beatS*0.8;
+      } else {
+        tx = hx[i]; ty = hy[i]; tz = hz[i];
+      }
+
+      const k = mode === 'text' ? kT : (mode === 'heart' ? kH : kD);
+      px[i] += (tx-px[i])*k;
+      py[i] += (ty-py[i])*k;
+      pz[i] += (tz-pz[i])*k;
+
+      vx[i] += (Math.random()-0.5)*wander*wn[i];
+      vy[i] += (Math.random()-0.5)*wander*wn[i];
+      vz[i] += (Math.random()-0.5)*wander*wn[i]*0.6;
+
+      if (mode === 'diffuse' && haveR && sw !== 0) {
+        const dx = px[i]-rx, dy = py[i]-ry;
+        const inv = 1/(Math.sqrt(dx*dx+dy*dy)+0.3);
+        vx[i] -= dy*inv*sw;
+        vy[i] += dx*inv*sw;
+      }
+
+      if (haveL) {
+        const dx = px[i]-lx, dy = py[i]-ly, dz = pz[i]-lz;
+        const d2 = dx*dx+dy*dy+dz*dz;
+        if (d2 < LR*LR) {
+          const d = Math.sqrt(d2)+1e-4;
+          const f = 1 - d/LR;
+          const push = f*f*1.5;
+          vx[i] += dx/d*push; vy[i] += dy/d*push; vz[i] += dz/d*push*0.7;
+        }
+      }
+
+      px[i] += vx[i]*dt; py[i] += vy[i]*dt; pz[i] += vz[i]*dt;
+      vx[i] *= damp; vy[i] *= damp; vz[i] *= damp;
+
+      pos[i3] = px[i]; pos[i3+1] = py[i]; pos[i3+2] = pz[i];
+      const sh = 0.9 + 0.1*Math.sin(t*2 + pha[i]);
+      col[i3]   = base[i3]*sh;
+      col[i3+1] = base[i3+1]*sh;
+      col[i3+2] = base[i3+2]*sh;
+    }
+    geo.attributes.position.needsUpdate = true;
+    geo.attributes.color.needsUpdate = true;
+  }
+
+  const MODE_NAME = { text:'文字造型', heart:'爱心搏动', diffuse:'粒子扩散' };
+  function updateStatus(){
+    let s = '模式：' + MODE_NAME[mode];
+    if (state.left.present) s += ' ｜ 左手：' + (state.left.gesture ? '手势' + state.left.gesture + '（' + TEXT_LIST[state.left.gesture] + '）' : '未识别');
+    else s += ' ｜ 左手：未检测';
+    if (state.right.present) s += ' ｜ 右手：' + (state.right.open ? '张开(扩散)' : '握拳(爱心)');
+    else s += ' ｜ 右手：未检测';
+    statusEl.textContent = s;
+  }
+
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => {
+    const dt = Math.min(clock.getDelta(), 0.05);
+    updateParticles(dt, clock.elapsedTime);
+    updateStatus();
+    renderer.render(scene, camera);
+  });
+
+  /* ============================ MediaPipe 多CDN加载 ============================ */
+  function loadScript(src){
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.crossOrigin = 'anonymous';
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('加载失败: ' + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function initMediaPipe(){
+    if (typeof Hands !== 'undefined' && typeof Camera !== 'undefined') {
+      return './lib/mediapipe/hands/';
+    }
+    const candidates = [
+      {
+        scripts: [
+          'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js',
+          'https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js',
+        ],
+        locate: 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/',
+      },
+      {
+        scripts: [
+          'https://unpkg.com/@mediapipe/camera_utils/camera_utils.js',
+          'https://unpkg.com/@mediapipe/hands/hands.js',
+        ],
+        locate: 'https://unpkg.com/@mediapipe/hands/',
+      },
+      {
+        scripts: [
+          'https://registry.npmmirror.com/@mediapipe/camera_utils/0.3.1675466862/files/camera_utils.js',
+          'https://registry.npmmirror.com/@mediapipe/hands/0.4.1675469240/files/hands.js',
+        ],
+        locate: 'https://registry.npmmirror.com/@mediapipe/hands/0.4.1675469240/files/',
+      },
+    ];
+    for (const cand of candidates) {
+      try {
+        for (const url of cand.scripts) await loadScript(url);
+        if (typeof Hands !== 'undefined' && typeof Camera !== 'undefined') return cand.locate;
+      } catch (e) { /* 切换下一个 CDN */ }
+    }
+    throw new Error('MediaPipe CDN 加载失败，请检查网络后刷新页面。');
+  }
+
+  (async () => {
+    try {
+      const locate = await initMediaPipe();
+      const hands = new Hands({ locateFile: (file) => locate + file });
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+      });
+      hands.onResults(onResults);
+
+      const cam = new Camera(video, {
+        onFrame: async () => { await hands.send({ image: video }); },
+        width: 1280,
+        height: 720,
+      });
+      cam.start().catch((e) => {
+        document.getElementById('err').textContent = '摄像头开启失败：' + (e && e.message ? e.message : e) + '（请使用 localhost / HTTPS 打开，并允许摄像头权限）';
+      });
+      setTimeout(() => { loadingEl.classList.add('hide'); }, 12000);
+    } catch (e) {
+      document.getElementById('err').textContent = e.message;
+    }
+  })();
+  </script>
+</body>
+</html>
