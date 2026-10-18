@@ -233,8 +233,8 @@
 
   /* ============================ 手势状态 ============================ */
   const state = {
-    left:  { present:false, x:0, y:0, z:0, scale:0, gesture:0, raw:-1, stable:0 },
-    right: { present:false, x:0, y:0, z:0, scale:0, open:true, angle:0, prev:0, smoothAngVel:0 },
+    left:  { present:false, x:0, y:0, z:0, scale:0, gesture:0, raw:-1, stable:0, pending:-1, pendingN:0, finger:[0,0,0,0] },
+    right: { present:false, x:0, y:0, z:0, scale:0, open:true, angle:0, prev:0, smoothAngVel:0, want:null, wantN:0, finger:[0,0,0,0] },
   };
 
   function videoToWorld(nx, ny, nz){
@@ -261,18 +261,22 @@
     for (const k of [0,5,9,13,17]) { x+=lm[k].x; y+=lm[k].y; z+=lm[k].z; }
     return videoToWorld(x/5, y/5, z/5);
   }
-  function fingersExtended(lm){
-    const wrist = lm[0];
-    const tips = [8,12,16,20], pips = [6,10,14,18];
+  const FINGER_DEFS = [[8,6,5],[12,10,9],[16,14,13],[20,18,17]];
+  function fingersExtended(lm, st){
+    const dist = (a,b) => Math.hypot(lm[a].x-lm[b].x, lm[a].y-lm[b].y);
     let count = 0;
+    /* 指尖->中节 vs 中节->掌指 之比（对旋转不敏感），带迟滞防抖 */
     for (let f = 0; f < 4; f++) {
-      const dTip = Math.hypot(lm[tips[f]].x-wrist.x, lm[tips[f]].y-wrist.y);
-      const dPip = Math.hypot(lm[pips[f]].x-wrist.x, lm[pips[f]].y-wrist.y);
-      if (dTip > dPip * 1.08) count++;
+      const [tip, pip, mcp] = FINGER_DEFS[f];
+      const ratio = dist(tip, pip) / (dist(pip, mcp) + 1e-6);
+      let on = st.finger[f];
+      if (ratio > 1.18) on = 1;
+      else if (ratio < 0.92) on = 0;
+      st.finger[f] = on;
+      if (on) count++;
     }
-    const t1 = Math.hypot(lm[4].x-lm[2].x, lm[4].y-lm[2].y);
-    const t2 = Math.hypot(lm[3].x-lm[2].x, lm[3].y-lm[2].y);
-    return { count, thumb: t1 > t2*1.25 };
+    const t1 = dist(4, 2), t2 = dist(3, 2);
+    return { count, thumb: t1 > t2*1.35 };
   }
   function handSize(lm){
     const a = videoToWorld(lm[0].x, lm[0].y, lm[0].z);
@@ -288,6 +292,7 @@
     st.x += (c.x-st.x)*0.5; st.y += (c.y-st.y)*0.5; st.z += (c.z-st.z)*0.5;
     const hs = handSize(lm);
     st.scale = st.scale ? st.scale*0.7 + hs*0.3 : hs;
+    const cnt = fingersExtended(lm, st).count;
 
     if (name === 'right') {
       const a = videoToWorld(lm[0].x, lm[0].y, lm[0].z);
@@ -300,31 +305,57 @@
       const av = dt > 0 ? dA/dt : 0;
       st.smoothAngVel = st.smoothAngVel*0.86 + av*0.14;
       st.smoothAngVel = Math.max(-5, Math.min(5, st.smoothAngVel));
-      const cnt = fingersExtended(lm).count;
-      if (cnt >= 3) st.open = true;
-      else if (cnt <= 1) st.open = false;
+      /* 开/握拳：连续 2 帧一致才切换，避免临界抖动 */
+      const wantOpen = cnt >= 3 ? true : (cnt <= 1 ? false : st.want);
+      if (wantOpen === st.want) st.wantN = Math.min(st.wantN + 1, 5);
+      else { st.want = wantOpen; st.wantN = 1; }
+      if (wantOpen !== null && st.wantN >= 2) st.open = wantOpen;
     } else {
-      const cnt = fingersExtended(lm).count;
-      if (cnt !== st.raw) { st.raw = cnt; st.stable = 0; }
-      else st.stable++;
-      if (st.stable >= 8) {
-        if (cnt >= 1 && cnt <= 3) st.gesture = cnt;
-        else if (cnt === 0) st.gesture = 0;
+      /* 伸出指数：连续 2 帧相同才认作新值，再稳定 5 帧后落定手势（响应快且抗抖） */
+      if (cnt === st.raw) {
+        st.stable = Math.min(st.stable + 1, 30);
+      } else {
+        if (cnt === st.pending) st.pendingN++;
+        else { st.pending = cnt; st.pendingN = 1; }
+        if (st.pendingN >= 2) { st.raw = cnt; st.stable = 0; }
+      }
+      if (st.stable >= 5) {
+        st.gesture = (cnt >= 1 && cnt <= 3) ? cnt : 0;
       }
     }
   }
 
   let lastFrame = performance.now();
   let gotFirst = false;
+  let labelLeftMeansLeft = null;  // 双手同现时校准 MediaPipe 标记与代码左右的关系
   function onResults(results){
     if (!gotFirst) { gotFirst = true; loadingEl.classList.add('hide'); }
     const handsArr = results.multiHandLandmarks || [];
-    const sorted = handsArr.map(lm => ({ lm, sx: 1-lm[0].x })).sort((A,B) => A.sx - B.sx);
+    const labels = results.multiHandedness || [];
+    const list = handsArr.map((lm, i) => ({
+      lm,
+      sx: 1 - lm[0].x,
+      isLeft: labels[i] ? labels[i].label === 'Left' : null,
+    }));
+    if (list.length === 2 && list[0].isLeft !== null && list[1].isLeft !== null) {
+      const bySx = [...list].sort((a,b) => a.sx - b.sx);
+      labelLeftMeansLeft = bySx[0].isLeft;  // 镜像后左半屏=代码左手
+    }
+    let left = null, right = null;
+    if (list.length === 1 && list[0].isLeft !== null && labelLeftMeansLeft !== null) {
+      /* 单手也按左右手标记归属，仅一只手即可触发对应手势 */
+      if (list[0].isLeft === labelLeftMeansLeft) left = list[0];
+      else right = list[0];
+    } else {
+      const bySx = [...list].sort((a,b) => a.sx - b.sx);
+      left = bySx[0] || null;
+      right = bySx[1] || null;
+    }
     const now = performance.now();
     const dt = Math.max(0.001, (now - lastFrame)/1000);
     lastFrame = now;
-    updateHand('left',  sorted[0] ? sorted[0].lm : null, dt);
-    updateHand('right', sorted[1] ? sorted[1].lm : null, dt);
+    updateHand('left',  left  ? left.lm  : null, dt);
+    updateHand('right', right ? right.lm : null, dt);
   }
 
   /* ============================ 粒子主循环 ============================ */
@@ -486,8 +517,8 @@
       hands.setOptions({
         maxNumHands: 2,
         modelComplexity: 1,
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5,
+        minDetectionConfidence: 0.4,
+        minTrackingConfidence: 0.4,
       });
       hands.onResults(onResults);
 
